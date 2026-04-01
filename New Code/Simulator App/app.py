@@ -15,11 +15,6 @@ import uuid
 import zipfile
 import io
 from pathlib import Path
-import sys
-import plotly
-st.write("Python executable:", sys.executable)
-st.write("Python version:", sys.version)
-st.write("Plotly version:", plotly.__version__)
 
 from simulation_engine import SimulationConfig, PathSimulator
 def fig_to_png_bytes(fig, scale: int = 2) -> bytes:
@@ -100,6 +95,38 @@ def apply_path_chart_layout(fig, y_range):
         )
     )
     add_ten_percent_reference_lines(fig, y_range)
+
+
+def build_path_figure(results, config, path_index: int, include_realized_return: bool = False):
+    """Build a path chart only when the UI needs it."""
+    fig = make_subplots()
+
+    H = config.time_horizon
+    T_is = config.years_insample
+
+    if include_realized_return:
+        r_plot = results['returns_pred'][H:T_is+H+1:H, path_index] * 100
+        x_returns = np.arange(-40, 1)
+    else:
+        r_plot = results['returns_pred'][H:T_is+1:H, path_index] * 100
+        x_returns = np.arange(-40, 0)
+
+    s_plot = results['signal_pred'][0:T_is+H+1:H, path_index] * 100
+    x_signal = np.arange(-40, 1)
+
+    fig.add_trace(go.Scatter(
+        x=x_returns, y=r_plot,
+        name='Return',
+        line=RETURN_LINE_STYLE
+    ))
+
+    fig.add_trace(go.Scatter(
+        x=x_signal, y=s_plot,
+        name='Predictive signal',
+        line=SIGNAL_LINE_STYLE
+    ))
+
+    return fig
 
 # Page configuration
 st.set_page_config(
@@ -353,6 +380,20 @@ with st.sidebar:
     
     # Export Controls
     st.subheader("Results Export")
+    show_sample_paths = st.checkbox(
+        "Render Sample Path Charts",
+        value=False,
+        help="Leave this off for faster runs. Plotly chart rendering is one of the slowest UI steps."
+    )
+    st.session_state.show_sample_paths = show_sample_paths
+
+    enable_png_export = st.checkbox(
+        "Enable PNG Plot Export",
+        value=False,
+        help="Prepare downloadable PNG plot bundles only when needed. This can be slow."
+    )
+    st.session_state.enable_png_export = enable_png_export
+
     enable_csv_export = st.checkbox(
         "Enable CSV Export of Paths",
         value=False,
@@ -384,13 +425,6 @@ if run_button:
                 if default_path.exists():
                     spx_data_path = str(default_path)
                     validate_spx = True
-        
-        # Debug: Show what values we're using
-        st.write("**Debug - Before Simulation:**")
-        st.write(f"- enable_validation checkbox: {enable_validation}")
-        st.write(f"- validate_spx computed: {validate_spx}")
-        st.write(f"- spx_data_path: {spx_data_path}")
-        st.write("---")
         
         # Create configuration
         config = SimulationConfig(
@@ -431,21 +465,6 @@ if st.session_state.results is not None:
     results = st.session_state.results
     config = st.session_state.config
     validation = results.get('validation', {})
-    
-     # Sanity check: can delete if graphs look ok
-    st.write("Raw signal range:", float(results['signal_pred_actual'].min()), float(results['signal_pred_actual'].max()))
-    st.write("Fitted signal range:", float(results['signal_pred'].min()), float(results['signal_pred'].max()))
-
-    # Debug: Show validation configuration
-    with st.expander("🔧 Debug: Validation Configuration", expanded=False):
-        st.write(f"**Validation Enabled:** {config.validate_with_spx}")
-        st.write(f"**SPX Data Path:** {config.spx_data_path}")
-        st.write(f"**Validation Results Present:** {bool(validation)}")
-        if validation:
-            st.write(f"**Validation Keys:** {list(validation.keys())}")
-            if 'spx_stats' in validation:
-                st.write("✓ SPX statistics loaded")
-            st.write(f"✓ Predictable validation: {len(validation['predictable'].get('regressions', []))} paths")
             
     # Alert/Warning System (PRIORITY 6)
     if validation:
@@ -830,94 +849,16 @@ Random Seed:            {config.random_seed}
     
     # Sample paths visualization with Regression Statistics (PRIORITY 5)
     st.subheader("Sample Paths")
-    # Collect PNGs for download
-    png_files = []  # list of (filename, bytes)
     shared_y_range = compute_shared_y_range(results, config)
 
-    if config.n_paths_predictable > 0:
+    if config.n_paths_predictable > 0 and st.session_state.get('show_sample_paths', False):
         for i in range(min(3, config.n_paths_predictable)):
-            fig = make_subplots()
-
-            H = config.time_horizon
-            T_is = config.years_insample  # = 40H
-
-            # ✅ Returns: 40 points, x from -40..-1
-            r_plot = results['returns_pred'][H:T_is+1:H, i] * 100
-            x_returns = np.arange(-40, 0)
-
-            # ✅ Signal: 41 points, includes period 1 ahead at x=0
-            s_plot = results['signal_pred'][0:T_is+H+1:H, i] * 100
-            x_signal = np.arange(-40, 1)
-
-            fig.add_trace(go.Scatter(
-                x=x_returns, y=r_plot,
-                name='Return',
-                line=RETURN_LINE_STYLE
-            ))
-
-            fig.add_trace(go.Scatter(
-                x=x_signal, y=s_plot,
-                name='Predictive signal',
-                line=SIGNAL_LINE_STYLE
-            ))
+            fig = build_path_figure(results, config, i, include_realized_return=False)
             apply_path_chart_layout(fig, shared_y_range)
-
             st.plotly_chart(fig, use_container_width=True)
-
-            # ✅ Prepare PNG bytes for download + (optional) save to disk
-            try:
-                png_bytes = fig_to_png_bytes(fig, scale=2)
-                fname = f"predictable_path_{i+1}.png"
-                png_files.append((fname, png_bytes))
-
-                # Optional: save on server disk too
-                save_dir = Path(__file__).parent / "saved_runs" / st.session_state.run_id / "plots_png"
-                save_dir.mkdir(parents=True, exist_ok=True)
-                (save_dir / fname).write_bytes(png_bytes)
-
-            except Exception as e:
-                st.warning(f"PNG export failed for path {i+1}: {e}")
-
-
-            # === REALIZED RETURNS FIGURE (41 returns) ===
-            fig_realized = make_subplots()
-
-            # ✅ Realized Returns: same 40 displayed returns plus the new t=0 return
-            r_plot_realized = results['returns_pred'][H:T_is+H+1:H, i] * 100
-            x_returns_realized = np.arange(-40, 1)
-
-            # ✅ Signal: same 41 points
-            s_plot_realized = results['signal_pred'][0:T_is+H+1:H, i] * 100
-            x_signal_realized = np.arange(-40, 1)
-
-            fig_realized.add_trace(go.Scatter(
-                x=x_returns_realized, y=r_plot_realized,
-                name='Return',
-                line=RETURN_LINE_STYLE
-            ))
-
-            fig_realized.add_trace(go.Scatter(
-                x=x_signal_realized, y=s_plot_realized,
-                name='Predictive signal',
-                line=SIGNAL_LINE_STYLE
-            ))
+            fig_realized = build_path_figure(results, config, i, include_realized_return=True)
             apply_path_chart_layout(fig_realized, shared_y_range)
-
             st.plotly_chart(fig_realized, use_container_width=True)
-
-            # ✅ Save realized returns PNG
-            try:
-                png_bytes_realized = fig_to_png_bytes(fig_realized, scale=2)
-                fname_realized = f"predictable_path_{i+1}_r.png"
-                png_files.append((fname_realized, png_bytes_realized))
-
-                # Optional: save on server disk too
-                save_dir = Path(__file__).parent / "saved_runs" / st.session_state.run_id / "plots_png"
-                save_dir.mkdir(parents=True, exist_ok=True)
-                (save_dir / fname_realized).write_bytes(png_bytes_realized)
-
-            except Exception as e:
-                st.warning(f"Realized PNG export failed for path {i+1}: {e}")
 
             # Regression statistics (unchanged)
             if validation and 'predictable' in validation:
@@ -941,39 +882,18 @@ Random Seed:            {config.random_seed}
                         st.write(f"R² = {reg['r2_lag']:.4f}")
 
                     st.write(f"**Autocorrelation:** ρ = {autocorr:.4f}")
+    elif config.n_paths_predictable > 0:
+        st.caption("Enable `Render Sample Path Charts` in the sidebar to display the interactive path figures.")
     else:
         st.info("No paths generated")
 
-    if config.n_paths_predictable > 0:
+    if config.n_paths_predictable > 0 and st.session_state.get('enable_png_export', False):
         zip_buffer = io.BytesIO()
 
         with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as z:
             for i in range(config.n_paths_predictable):
                 try:
-                    fig = make_subplots()
-
-                    H = config.time_horizon
-                    T_is = config.years_insample  # = 40H
-
-                    # Returns: 40 points, x from -40..-1
-                    r_plot = results['returns_pred'][H:T_is+1:H, i] * 100
-                    x_returns = np.arange(-40, 0)
-
-                    # Signal: 41 points, includes period 1 ahead at x=0
-                    s_plot = results['signal_pred'][0:T_is+H+1:H, i] * 100
-                    x_signal = np.arange(-40, 1)
-
-                    fig.add_trace(go.Scatter(
-                        x=x_returns, y=r_plot,
-                        name='Return',
-                        line=RETURN_LINE_STYLE
-                    ))
-
-                    fig.add_trace(go.Scatter(
-                        x=x_signal, y=s_plot,
-                        name='Predictive signal',
-                        line=SIGNAL_LINE_STYLE
-                    ))
+                    fig = build_path_figure(results, config, i, include_realized_return=False)
                     apply_path_chart_layout(fig, shared_y_range)
 
                     png_bytes = fig_to_png_bytes(fig, scale=2)
@@ -986,30 +906,7 @@ Random Seed:            {config.random_seed}
 
                 # === REALIZED RETURNS PNG (41 returns) ===
                 try:
-                    fig_realized = make_subplots()
-
-                    H = config.time_horizon
-                    T_is = config.years_insample
-
-                    # Realized Returns: same 40 displayed returns plus the new t=0 return
-                    r_plot_realized = results['returns_pred'][H:T_is+H+1:H, i] * 100
-                    x_returns_realized = np.arange(-40, 1)
-
-                    # Signal: 41 points
-                    s_plot_realized = results['signal_pred'][0:T_is+H+1:H, i] * 100
-                    x_signal_realized = np.arange(-40, 1)
-
-                    fig_realized.add_trace(go.Scatter(
-                        x=x_returns_realized, y=r_plot_realized,
-                        name='Return',
-                        line=RETURN_LINE_STYLE
-                    ))
-
-                    fig_realized.add_trace(go.Scatter(
-                        x=x_signal_realized, y=s_plot_realized,
-                        name='Predictive signal',
-                        line=SIGNAL_LINE_STYLE
-                    ))
+                    fig_realized = build_path_figure(results, config, i, include_realized_return=True)
                     apply_path_chart_layout(fig_realized, shared_y_range)
 
                     png_bytes_realized = fig_to_png_bytes(fig_realized, scale=2)
@@ -1026,6 +923,8 @@ Random Seed:            {config.random_seed}
             mime="application/zip",
             use_container_width=True
         )
+    elif config.n_paths_predictable > 0:
+        st.caption("Enable `Enable PNG Plot Export` in the sidebar to generate the PNG ZIP download.")
 
     st.divider()
     
