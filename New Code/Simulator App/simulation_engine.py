@@ -19,7 +19,7 @@ warnings.filterwarnings('ignore')
 class SimulationConfig:
     """Configuration parameters for the simulation"""
     # Path configuration
-    n_paths_predictable: int = 15
+    n_paths_predictable: int = 30
     
     # Time horizon
     time_horizon: int = 2  # H: Returns averaged over H years
@@ -32,8 +32,8 @@ class SimulationConfig:
     correlation_window: float = 0.02
     
     # Return parameters (from Cochrane 2009, US equity data)
-    mu: float = 0.0607        # Mean annual log return
-    sigma_eps: float = 0.192  # Annual return volatility
+    mu: float = 0.0607        # Mean annual arithmetic return
+    sigma_eps: float = 0.192  # Annual arithmetic return volatility
     
     # Signal parameters (AR(1) process)
     phi: float = 0.92            # Persistence coefficient
@@ -84,14 +84,11 @@ class PathSimulator:
         # +1 for 0-index start (signal/returns arrays)
         self.T = self.T_is + self.T_oos + 1                                   # = 41H + 1
         
-        # Calculate b' coefficient for h-year returns
-        self.b_prime_factor = sum(config.phi**i for i in range(config.time_horizon))
-        
-        # Calculate b to achieve target R²
-        target_r2 = config.target_correlation ** 2
-        var_signal = config.sigma_delta**2 / (1 - config.phi**2)
-        var_return = config.sigma_eps**2 / config.time_horizon
-        self.B = np.sqrt(target_r2 * var_return / (var_signal * self.b_prime_factor**2))
+        # Average effect of the persistent signal on the next H-period average return
+        self.b_prime_factor = sum(config.phi**i for i in range(config.time_horizon)) / config.time_horizon
+        self.var_signal = config.sigma_delta**2 / (1 - config.phi**2)
+        self.sigma_eps_effective = config.sigma_eps
+        self.B = 0.0
         
         # Load SPX data if validation enabled
         self.spx_returns_h = None
@@ -103,6 +100,28 @@ class PathSimulator:
             print(f"Time Horizon: {config.time_horizon}")
             print(f"{'='*80}")
             self._load_spx_data()
+        
+        self._calibrate_process_parameters()
+
+    def _calibrate_process_parameters(self):
+        """Calibrate the predictable process to the target correlation and H-period volatility."""
+        target_corr = self.config.target_correlation
+        target_r2 = target_corr ** 2
+
+        if self.spx_returns_h is not None and len(self.spx_returns_h) > 1:
+            target_h_std = float(np.std(self.spx_returns_h))
+            beta_h = target_corr * target_h_std / np.sqrt(self.var_signal)
+            noise_var_h = max(target_h_std**2 * (1 - target_r2), 1e-12)
+
+            self.sigma_eps_effective = np.sqrt(noise_var_h * self.config.time_horizon)
+            self.B = beta_h / self.b_prime_factor
+            return
+
+        noise_var_h = self.sigma_eps_effective**2 / self.config.time_horizon
+        scaling = max(1 - target_r2, 1e-12)
+        self.B = np.sqrt(
+            (target_r2 / scaling) * noise_var_h / (self.var_signal * self.b_prime_factor**2)
+        )
     
     def _load_spx_data(self):
         """Load S&P 500 data for validation"""
@@ -223,17 +242,17 @@ class PathSimulator:
         signal_fitted = np.zeros((T, N))
         
         delta, eps = self.generate_correlated_shocks(
-            T, N, self.config.rho, self.config.sigma_delta, self.config.sigma_eps
+            T, N, self.config.rho, self.config.sigma_delta, self.sigma_eps_effective
         )
         
         for t in range(1, T):
             signal[t, :] = self.config.phi * signal[t-1, :] + delta[t, :] # state variable estimated from demeaned log dividend yield; equation B.1
         
         for t in range(1, T):
-            returns_annual[t, :] = self.config.mu + self.B * signal[t-1, :] + eps[t, :] # annual excess log return; equation B.1 BUT NOT DEMEANED
+            returns_annual[t, :] = self.config.mu + self.B * signal[t-1, :] + eps[t, :] # annual arithmetic return
         
         for t in range(H, T, H):
-            returns_h[t, :] = np.sum(returns_annual[t-(H-1):t+1, :], axis=0) / H # arithmetic average of H annual returns (r_1^p etc on p.23 of appendix)
+            returns_h[t, :] = np.sum(returns_annual[t-(H-1):t+1, :], axis=0) / H # arithmetic average of H annual returns
         
         b_prime = self.B * self.b_prime_factor
         for t in range(0, T-H, H):
@@ -258,18 +277,79 @@ class PathSimulator:
         
         return np.array(correlations)
     
-    def select_best_paths(self, correlations: np.ndarray, target: float, window: float, n_select: int) -> Tuple[np.ndarray, np.ndarray]:
-        """Select paths with correlation closest to target"""
+    def calculate_path_volatility(self, returns_h: np.ndarray) -> np.ndarray:
+        """Calculate H-period return volatility for each path."""
+        H = self.config.time_horizon
+        volatilities = []
+        
+        for i in range(returns_h.shape[1]):
+            r = returns_h[H:self.T_is:H, i]
+            r = r[~np.isnan(r)]
+            volatilities.append(r.std() if len(r) >= 2 else np.nan)
+        
+        return np.array(volatilities)
+
+    def summarize_simulated_returns(self, returns_h: np.ndarray, returns_annual: np.ndarray) -> Dict[str, Dict[str, float]]:
+        """Summarize selected simulated H-period and annual returns across all paths."""
+        H = self.config.time_horizon
+
+        h_values = returns_h[H:self.T_is:H, :].reshape(-1)
+        h_values = h_values[~np.isnan(h_values)]
+
+        annual_values = returns_annual[1:self.T_is+1, :].reshape(-1)
+        annual_values = annual_values[~np.isnan(annual_values)]
+
+        summary = {}
+        if len(h_values) > 0:
+            summary['h_year'] = {
+                'mean': float(np.mean(h_values)),
+                'std': float(np.std(h_values)),
+                'min': float(np.min(h_values)),
+                'max': float(np.max(h_values)),
+                'n_obs': int(len(h_values))
+            }
+
+        if len(annual_values) > 0:
+            summary['annual'] = {
+                'mean': float(np.mean(annual_values)),
+                'std': float(np.std(annual_values)),
+                'min': float(np.min(annual_values)),
+                'max': float(np.max(annual_values)),
+                'n_obs': int(len(annual_values))
+            }
+
+        return summary
+
+    def select_best_paths(
+        self,
+        correlations: np.ndarray,
+        target: float,
+        window: float,
+        n_select: int,
+        volatility_pass: Optional[np.ndarray] = None,
+        volatility_distance: Optional[np.ndarray] = None,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Select paths with correlation closest to target, prioritizing volatility-compliant paths."""
         valid_mask = ~np.isnan(correlations) & (np.abs(correlations - target) <= window)
+        if volatility_pass is not None:
+            valid_mask &= volatility_pass
         valid_indices = np.where(valid_mask)[0]
         valid_corrs = correlations[valid_mask]
         
         if len(valid_indices) < n_select:
             distances = np.abs(correlations - target)
             distances[np.isnan(correlations)] = 999
-            selected_indices = np.argsort(distances)[:n_select]
+            if volatility_pass is not None:
+                vol_penalty = np.where(volatility_pass, 0.0, 100.0)
+            else:
+                vol_penalty = np.zeros_like(distances)
+            if volatility_distance is None:
+                volatility_distance = np.zeros_like(distances)
+            selected_indices = np.argsort(vol_penalty + distances + volatility_distance)[:n_select]
         else:
             distances = np.abs(valid_corrs - target)
+            if volatility_distance is not None:
+                distances = distances + volatility_distance[valid_indices]
             sorted_idx = np.argsort(distances)[:n_select]
             selected_indices = valid_indices[sorted_idx]
         
@@ -463,10 +543,21 @@ class PathSimulator:
         # Calculate correlations and select paths
 
         corr_pred = self.calculate_correlation(returns_pred, signal_pred)
+        vol_pass_pred = None
+        vol_distance_pred = None
+        if self.config.validate_with_spx and self.spx_returns_h is not None:
+            spx_std = self.spx_returns_h.std()
+            path_vol_pred = self.calculate_path_volatility(returns_pred)
+            vol_pass_pred = np.array(self.validate_volatility_bounds(returns_pred, spx_std))
+            vol_distance_pred = np.abs(path_vol_pred - spx_std)
         idx_pred, selected_corr_pred = self.select_best_paths(
-                corr_pred, self.config.target_correlation, self.config.correlation_window,
-                self.config.n_paths_predictable
-            )
+            corr_pred,
+            self.config.target_correlation,
+            self.config.correlation_window,
+            self.config.n_paths_predictable,
+            volatility_pass=vol_pass_pred,
+            volatility_distance=vol_distance_pred,
+        )
         
         # Extract selected paths
         returns_pred_selected = signal_pred_actual_selected = signal_pred_selected = returns_pred_annual_selected = None
@@ -479,6 +570,16 @@ class PathSimulator:
 
         # Comprehensive validation
         validation_results = {}
+        if (
+            self.config.n_paths_predictable > 0
+            and returns_pred_selected is not None
+            and returns_pred_annual_selected is not None
+        ):
+            validation_results['simulated_stats'] = self.summarize_simulated_returns(
+                returns_pred_selected,
+                returns_pred_annual_selected
+            )
+
         if self.config.validate_with_spx and self.spx_returns_h is not None:
             print("Running comprehensive validation...")
             
@@ -544,8 +645,8 @@ class PathSimulator:
            
         # Store results
         self.results = {
-            'returns_pred': np.expm1(returns_pred_selected),
-            'returns_pred_annual': np.expm1(returns_pred_annual_selected),
+            'returns_pred': returns_pred_selected,
+            'returns_pred_annual': returns_pred_annual_selected,
             'signal_pred_actual': signal_pred_actual_selected,
             'signal_pred': signal_pred_selected,
             'correlations_pred': selected_corr_pred,

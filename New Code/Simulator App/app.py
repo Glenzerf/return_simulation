@@ -26,6 +26,81 @@ def fig_to_png_bytes(fig, scale: int = 2) -> bytes:
     # Requires: pip install -U kaleido
     return fig.to_image(format="png", scale=scale)
 
+
+RETURN_LINE_STYLE = dict(color='#ef4444', width=2.5)
+SIGNAL_LINE_STYLE = dict(color='#3b82f6', width=2.5, dash='6px,3px')
+
+
+def compute_shared_y_range(results, config):
+    """Use one y-axis range across all path charts."""
+    if results.get('returns_pred') is None or results.get('signal_pred') is None:
+        return [-20, 20]
+
+    H = config.time_horizon
+    T_is = config.years_insample
+
+    values = [
+        results['returns_pred'][H:T_is+1:H, :] * 100,
+        results['returns_pred'][0:T_is+H+1:H, :] * 100,
+        results['signal_pred'][0:T_is+H+1:H, :] * 100,
+    ]
+    y_all = np.concatenate([arr.reshape(-1) for arr in values if arr.size > 0])
+    y_min = np.floor(np.nanmin(y_all) / 10) * 10 - 10
+    y_max = np.ceil(np.nanmax(y_all) / 10) * 10 + 10
+    return [y_min, y_max]
+
+
+def add_ten_percent_reference_lines(fig, y_range):
+    """Add slightly heavier guide lines at 10% intervals."""
+    start = int(np.ceil(y_range[0] / 10.0) * 10)
+    end = int(np.floor(y_range[1] / 10.0) * 10)
+    for y in range(start, end + 1, 10):
+        fig.add_hline(y=y, line_width=1.6, line_color='rgba(0,0,0,0.24)', layer='below')
+
+
+def apply_path_chart_layout(fig, y_range):
+    fig.update_layout(
+        width=650,
+        height=450,
+        title="",
+        template='plotly_white',
+        legend=dict(
+            x=0.98,
+            y=0.98,
+            xanchor="right",
+            yanchor="top",
+            bgcolor="rgba(255,255,255,0.6)",
+            bordercolor="rgba(0,0,0,0.2)",
+            borderwidth=1
+        ),
+        margin=dict(l=20, r=20, t=10, b=20),
+        xaxis=dict(
+            title="Time",
+            range=[-40, 0],
+            tickmode='linear',
+            tick0=-40,
+            dtick=1,
+            ticklabelstep=5,
+            showgrid=True,
+            zeroline=False,
+            gridcolor='rgba(0,0,0,0.10)'
+        ),
+        yaxis=dict(
+            title="Return",
+            range=y_range,
+            tickmode='linear',
+            tickformat=".0f",
+            ticksuffix="%",
+            dtick=2,
+            ticklabelstep=5,
+            showgrid=True,
+            gridcolor='rgba(0,0,0,0.12)',
+            zeroline=True,
+            zerolinecolor='rgba(0,0,0,0.25)'
+        )
+    )
+    add_ten_percent_reference_lines(fig, y_range)
+
 # Page configuration
 st.set_page_config(
     page_title="Path Simulation",
@@ -88,7 +163,7 @@ PRESETS = {
     "Current (2-year)": {
         "time_horizon": 2,
         "target_correlation": 0.50,
-        "n_paths_predictable": 15,
+        "n_paths_predictable": 30,
         "mu": 0.0607,
         "sigma_eps": 0.192,
         "phi": 0.92,
@@ -98,7 +173,7 @@ PRESETS = {
     "Alternative (5-year)": {
         "time_horizon": 5,
         "target_correlation": 0.57,
-        "n_paths_predictable": 15,
+        "n_paths_predictable": 30,
         "mu": 0.0607,
         "sigma_eps": 0.192,
         "phi": 0.92,
@@ -181,14 +256,14 @@ with st.sidebar:
             "Mean Return (μ)",
             value=preset_params["mu"],
             format="%.4f",
-            help="Mean annual log return"
+            help="Mean annual arithmetic return"
         )
         
         sigma_eps = st.number_input(
             "Return Volatility (σ_ε)",
             value=preset_params["sigma_eps"],
             format="%.4f",
-            help="Annual return volatility"
+            help="Annual arithmetic return volatility"
         )
         
         st.caption("Signal Parameters (AR(1))")
@@ -499,6 +574,32 @@ Random Seed:            {config.random_seed}
             st.write(f"Observations: {spx_1['n_obs']}")
         
         st.divider()
+
+    if validation and 'simulated_stats' in validation:
+        st.subheader("📊 Simulated Return Data")
+        simulated_stats = validation['simulated_stats']
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+            if 'h_year' in simulated_stats:
+                st.write(f"**{config.time_horizon}-Year Returns**")
+                sim_h = simulated_stats['h_year']
+                st.write(f"Mean: {sim_h['mean']:.4f} ({sim_h['mean']*100:.2f}%)")
+                st.write(f"Std Dev: {sim_h['std']:.4f}")
+                st.write(f"Min: {sim_h['min']:.4f} | Max: {sim_h['max']:.4f}")
+                st.write(f"Observations: {sim_h['n_obs']}")
+
+        with col2:
+            if 'annual' in simulated_stats:
+                st.write("**Annual Returns**")
+                sim_1 = simulated_stats['annual']
+                st.write(f"Mean: {sim_1['mean']:.4f} ({sim_1['mean']*100:.2f}%)")
+                st.write(f"Std Dev: {sim_1['std']:.4f}")
+                st.write(f"Min: {sim_1['min']:.4f} | Max: {sim_1['max']:.4f}")
+                st.write(f"Observations: {sim_1['n_obs']}")
+
+        st.divider()
     
     # Validation Results Panel (PRIORITY 1)
 
@@ -731,6 +832,7 @@ Random Seed:            {config.random_seed}
     st.subheader("Sample Paths")
     # Collect PNGs for download
     png_files = []  # list of (filename, bytes)
+    shared_y_range = compute_shared_y_range(results, config)
 
     if config.n_paths_predictable > 0:
         for i in range(min(3, config.n_paths_predictable)):
@@ -749,62 +851,16 @@ Random Seed:            {config.random_seed}
 
             fig.add_trace(go.Scatter(
                 x=x_returns, y=r_plot,
-                name='Returns',
-                line=dict(color='#ef4444', width=2)
+                name='Return',
+                line=RETURN_LINE_STYLE
             ))
 
             fig.add_trace(go.Scatter(
                 x=x_signal, y=s_plot,
-                name='Signal',
-                line=dict(color='#3b82f6', width=2, dash='dash')
+                name='Predictive signal',
+                line=SIGNAL_LINE_STYLE
             ))
-
-            y_all = np.concatenate([r_plot, s_plot])
-
-            y_min = np.floor(y_all.min() / 10) * 10 - 10
-            y_max = np.ceil(y_all.max() / 10) * 10 + 10
-
-            # ✅ No titles, x-range -40..0, horizontal lines every 10pp
-            fig.update_layout(
-                width=650,
-                height=450,
-                title="",
-                template='plotly_white',
-                legend=dict(
-                    x=0.98,
-                    y=0.98,
-                    xanchor="right",
-                    yanchor="top",
-                    bgcolor="rgba(255,255,255,0.6)",  
-                    bordercolor="rgba(0,0,0,0.2)",
-                    borderwidth=1
-                ),
-                margin=dict(l=20, r=20, t=10, b=20),
-                xaxis=dict(
-                    title=None,              
-                    range=[-40, 0],          
-                    tickmode='linear',
-                    tick0=-40,
-                    dtick=1,               # optional: label every 10
-                    ticklabelstep = 5,
-                    showgrid=True,
-                    zeroline=False,
-                    gridcolor='rgba(0,0,0,0.10)'
-                ),
-                yaxis=dict(
-                    title="",              # ✅ no axis title
-                    range=[y_min, y_max], 
-                    tickmode='linear',
-                    tickformat=".0f",
-                    ticksuffix="%",
-                    dtick=2,               # ✅ horizontal lines each 2pp
-                    ticklabelstep = 5,
-                    showgrid=True,
-                    gridcolor='rgba(0,0,0,0.12)',
-                    zeroline=True,
-                    zerolinecolor='rgba(0,0,0,0.25)'
-                )
-            )
+            apply_path_chart_layout(fig, shared_y_range)
 
             st.plotly_chart(fig, use_container_width=True)
 
@@ -821,6 +877,47 @@ Random Seed:            {config.random_seed}
 
             except Exception as e:
                 st.warning(f"PNG export failed for path {i+1}: {e}")
+
+
+            # === REALIZED RETURNS FIGURE (41 returns) ===
+            fig_realized = make_subplots()
+
+            # ✅ Realized Returns: same 40 displayed returns plus the new t=0 return
+            r_plot_realized = results['returns_pred'][H:T_is+H+1:H, i] * 100
+            x_returns_realized = np.arange(-40, 1)
+
+            # ✅ Signal: same 41 points
+            s_plot_realized = results['signal_pred'][0:T_is+H+1:H, i] * 100
+            x_signal_realized = np.arange(-40, 1)
+
+            fig_realized.add_trace(go.Scatter(
+                x=x_returns_realized, y=r_plot_realized,
+                name='Return',
+                line=RETURN_LINE_STYLE
+            ))
+
+            fig_realized.add_trace(go.Scatter(
+                x=x_signal_realized, y=s_plot_realized,
+                name='Predictive signal',
+                line=SIGNAL_LINE_STYLE
+            ))
+            apply_path_chart_layout(fig_realized, shared_y_range)
+
+            st.plotly_chart(fig_realized, use_container_width=True)
+
+            # ✅ Save realized returns PNG
+            try:
+                png_bytes_realized = fig_to_png_bytes(fig_realized, scale=2)
+                fname_realized = f"predictable_path_{i+1}_r.png"
+                png_files.append((fname_realized, png_bytes_realized))
+
+                # Optional: save on server disk too
+                save_dir = Path(__file__).parent / "saved_runs" / st.session_state.run_id / "plots_png"
+                save_dir.mkdir(parents=True, exist_ok=True)
+                (save_dir / fname_realized).write_bytes(png_bytes_realized)
+
+            except Exception as e:
+                st.warning(f"Realized PNG export failed for path {i+1}: {e}")
 
             # Regression statistics (unchanged)
             if validation and 'predictable' in validation:
@@ -868,58 +965,16 @@ Random Seed:            {config.random_seed}
 
                     fig.add_trace(go.Scatter(
                         x=x_returns, y=r_plot,
-                        name='Returns',
-                        line=dict(color='#ef4444', width=2)
+                        name='Return',
+                        line=RETURN_LINE_STYLE
                     ))
 
                     fig.add_trace(go.Scatter(
                         x=x_signal, y=s_plot,
-                        name='Signal',
-                        line=dict(color='#3b82f6', width=2, dash='dash')
+                        name='Predictive signal',
+                        line=SIGNAL_LINE_STYLE
                     ))
-
-                    y_all = np.concatenate([r_plot, s_plot])
-                    y_min = np.floor(y_all.min() / 10) * 10 - 10
-                    y_max = np.ceil(y_all.max() / 10) * 10 + 10
-
-                    fig.update_layout(
-                        width=650,
-                        height=450,
-                        title="",
-                        template='plotly_white',
-                        legend=dict(
-                            x=0.98,
-                            y=0.98,
-                            xanchor="right",
-                            yanchor="top",
-                            bgcolor="rgba(255,255,255,0.6)",
-                            bordercolor="rgba(0,0,0,0.2)",
-                            borderwidth=1
-                        ),
-                        margin=dict(l=20, r=20, t=10, b=20),
-                        xaxis=dict(
-                            title=None,
-                            range=[-40, 0],
-                            tickmode='linear',
-                            tick0=-40,
-                            dtick=1,
-                            ticklabelstep=5,
-                            showgrid=True,
-                            zeroline=False,
-                            gridcolor='rgba(0,0,0,0.10)'
-                        ),
-                        yaxis=dict(
-                            title="",
-                            range=[y_min, y_max],
-                            tickmode='linear',
-                            dtick=2,
-                            ticklabelstep=5,
-                            showgrid=True,
-                            gridcolor='rgba(0,0,0,0.12)',
-                            zeroline=True,
-                            zerolinecolor='rgba(0,0,0,0.25)'
-                        )
-                    )
+                    apply_path_chart_layout(fig, shared_y_range)
 
                     png_bytes = fig_to_png_bytes(fig, scale=2)
                     fname = f"predictable_path_{i+1}.png"
@@ -927,6 +982,42 @@ Random Seed:            {config.random_seed}
 
                 except Exception as e:
                     st.warning(f"PNG export failed for path {i+1}: {e}")
+
+
+                # === REALIZED RETURNS PNG (41 returns) ===
+                try:
+                    fig_realized = make_subplots()
+
+                    H = config.time_horizon
+                    T_is = config.years_insample
+
+                    # Realized Returns: same 40 displayed returns plus the new t=0 return
+                    r_plot_realized = results['returns_pred'][H:T_is+H+1:H, i] * 100
+                    x_returns_realized = np.arange(-40, 1)
+
+                    # Signal: 41 points
+                    s_plot_realized = results['signal_pred'][0:T_is+H+1:H, i] * 100
+                    x_signal_realized = np.arange(-40, 1)
+
+                    fig_realized.add_trace(go.Scatter(
+                        x=x_returns_realized, y=r_plot_realized,
+                        name='Return',
+                        line=RETURN_LINE_STYLE
+                    ))
+
+                    fig_realized.add_trace(go.Scatter(
+                        x=x_signal_realized, y=s_plot_realized,
+                        name='Predictive signal',
+                        line=SIGNAL_LINE_STYLE
+                    ))
+                    apply_path_chart_layout(fig_realized, shared_y_range)
+
+                    png_bytes_realized = fig_to_png_bytes(fig_realized, scale=2)
+                    fname_realized = f"predictable_path_{i+1}_r.png"
+                    z.writestr(fname_realized, png_bytes_realized)
+
+                except Exception as e:
+                    st.warning(f"Realized PNG export failed for path {i+1}: {e}")
 
         st.download_button(
             label="Download All Plots (PNG ZIP)",
@@ -1022,7 +1113,7 @@ Random Seed:            {config.random_seed}
                         T_is = config.years_insample
                         
                         r_plot = results['returns_pred'][H:T_is+1:H, i] * 100
-                        s_plot = results['signal_pred'][0:T_is:H+1, i] * 100
+                        s_plot = results['signal_pred'][0:T_is+H+1:H, i] * 100
 
                         x_returns = np.arange(-40, 0)
                         x_signal = np.arange(-40, 1)
@@ -1030,20 +1121,16 @@ Random Seed:            {config.random_seed}
                         fig.add_trace(go.Scatter(
                             x=x_returns, y=r_plot,
                             name='Return',
-                            line=dict(color='#ef4444', width=2)
+                            line=RETURN_LINE_STYLE
                         ))
 
                         fig.add_trace(go.Scatter(
                             x=x_signal, y=s_plot,
-                            name='Signal',
-                            line=dict(color='#3b82f6', width=2, dash='dash')
+                            name='Predictive signal',
+                            line=SIGNAL_LINE_STYLE
                         ))
 
-                        fig.update_layout(
-                            title=None,
-                            showlegend=True,
-                            template='plotly_white'
-                        )
+                        apply_path_chart_layout(fig, shared_y_range)
                         
                         # Save to HTML string
                         html_str = fig.to_html(full_html=True, include_plotlyjs='cdn')
