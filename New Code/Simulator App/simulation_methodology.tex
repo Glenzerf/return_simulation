@@ -1,0 +1,212 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+
+\title{Simulation Methodology Outline}
+\date{}
+
+\begin{document}
+\maketitle
+
+\noindent This outline describes the methodology implemented in \texttt{simulation\_engine.py} and configured through \texttt{app.py}. It is intentionally limited to the code's actual behavior.
+
+\section*{Configuration and Sample Construction}
+\begin{itemize}
+\item The app simulates only ``predictable'' paths.
+\item The number of retained paths is set by \texttt{n\_paths\_predictable}, and the number of candidate paths drawn before selection is set by \texttt{n\_simulations}.
+\item The horizon parameter \(H\) is \texttt{time\_horizon}. Returns are summarized as arithmetic averages over \(H\) annual returns.
+\item The code fixes the displayed in-sample history to \texttt{n\_h\_periods = 40} horizon returns, so the in-sample span equals \(40H\) years.
+\item The simulator also creates one additional out-of-sample horizon, so the total annual simulation length is \(41H\) years plus the initial time-\(0\) state. Formally:
+\[
+T_{\mathrm{IS}} = 40H,\qquad T_{\mathrm{OOS}} = H,\qquad T = 41H + 1.
+\]
+\item The default parameterization exposed in the app is:
+\[
+\mu = 0.0607,\quad \sigma_{\varepsilon} = 0.192,\quad \phi = 0.92,\quad \sigma_{\delta} = 0.152,\quad \rho = -0.72.
+\]
+\item The app allows the user to change \(H\), the target correlation, the correlation tolerance window, the number of simulated candidate paths, and the random seed before running the simulator.
+\end{itemize}
+
+\section*{Latent Signal Process}
+\begin{itemize}
+\item The predictive state variable is simulated as an AR(1) process:
+\[
+x_t = \phi x_{t-1} + \delta_t.
+\]
+\item The initial state \(x_0\) is not fixed; it is drawn independently for each path from the stationary distribution:
+\[
+x_0 \sim \mathcal{N}\!\left(0,\frac{\sigma_{\delta}^2}{1-\phi^2}\right).
+\]
+\item The code stores the latent state in the array \texttt{signal}.
+\item Signal innovations \(\delta_t\) are generated jointly with return shocks so that the two shocks have correlation \(\rho\).
+\end{itemize}
+
+\section*{Return Process}
+\begin{itemize}
+\item Annual arithmetic returns are simulated as
+\[
+r_t = \mu + B x_{t-1} + \varepsilon_t,
+\]
+where \(B\) is calibrated inside the simulator and \(\varepsilon_t\) is the return innovation.
+\item The pair \((\delta_t,\varepsilon_t)\) is generated from a bivariate Gaussian system using Cholesky decomposition, with marginal standard deviations \(\sigma_{\delta}\) and \(\sigma_{\varepsilon}^{\mathrm{effective}}\), respectively, and contemporaneous correlation \(\rho\).
+\item The parameter \(B\) is not entered directly by the user. Instead, the simulator chooses \(B\) so that the correlation between the horizon return and the predictive signal matches the user-specified target correlation.
+\item Define
+\[
+b' = B \cdot \frac{1}{H}\sum_{i=0}^{H-1}\phi^i.
+\]
+This is the code's average effect of the persistent signal on the next \(H\)-period average return.
+\item Horizon returns are then constructed as non-overlapping arithmetic averages of annual returns:
+\[
+r_t^{(H)} = \frac{1}{H}\sum_{j=0}^{H-1} r_{t-j},
+\]
+computed only at dates \(t = H, 2H, \dots\).
+\item In addition to the latent state \(x_t\), the code constructs a fitted predictive series
+\[
+\hat r_{t,t+H} = \mu + b' x_t.
+\]
+\item This fitted series, stored as \texttt{signal\_fitted} and later returned to the app as \texttt{signal\_pred}, is the object used for correlation calculations, regressions, and plotting of the predictive signal. The raw latent state is stored separately as \texttt{signal\_pred\_actual}.
+\end{itemize}
+
+\section*{Calibration of Predictability and Volatility}
+\begin{itemize}
+\item Let the target correlation chosen in the app be \(c\), with implied target \(R^2 = c^2\).
+\item The code first computes the stationary signal variance:
+\[
+\mathrm{Var}(x_t) = \frac{\sigma_{\delta}^2}{1-\phi^2}.
+\]
+\item If S\&P 500 reference data are available, the simulator uses the empirical standard deviation of \(H\)-year returns, denoted \(\sigma_H^{\mathrm{SPX}}\), to calibrate both \(B\) and the effective annual return shock variance.
+\item In that case, the code sets
+\[
+\beta_H = c \cdot \frac{\sigma_H^{\mathrm{SPX}}}{\sqrt{\mathrm{Var}(x_t)}},
+\qquad
+\mathrm{Var}(\text{noise over }H) = (\sigma_H^{\mathrm{SPX}})^2 (1-c^2),
+\]
+then chooses
+\[
+\sigma_{\varepsilon}^{\mathrm{effective}} = \sqrt{H \cdot \mathrm{Var}(\text{noise over }H)},
+\qquad
+B = \frac{\beta_H}{b'}.
+\]
+\item If S\&P 500 reference data are not available, the code keeps \(\sigma_{\varepsilon}^{\mathrm{effective}} = \sigma_{\varepsilon}\) and solves directly for \(B\) from the target \(R^2\), the annual return noise variance scaled to the \(H\)-period average, the signal variance, and the persistence adjustment \(b'\).
+\item Therefore, with validation data turned on, the model calibration targets both predictability and the empirical volatility of \(H\)-period returns; without validation data, calibration targets predictability only.
+\end{itemize}
+
+\section*{Selection Variable and In-Sample Correlation}
+\begin{itemize}
+\item After generating all candidate paths, the code computes one path-specific correlation for each candidate.
+\item This correlation is calculated between:
+\begin{itemize}
+\item realized non-overlapping \(H\)-period returns \(r_t^{(H)}\), and
+\item the fitted predictive series \(\hat r_{t,t+H} = \mu + b' x_t\) observed at the beginning of each horizon.
+\end{itemize}
+\item The correlation uses the slices
+\[
+\texttt{returns\_h[H:T\_is:H]}, \qquad \texttt{signal\_h[0:T\_is-H:H]}.
+\]
+\item Because Python slicing excludes the stop index, the selection correlation is computed from 39 in-sample horizon observations when \texttt{n\_h\_periods = 40}. The final in-sample horizon and the out-of-sample horizon are not used in this correlation screen.
+\item A path is initially considered admissible if its correlation lies inside the window
+\[
+| \widehat{\mathrm{Corr}} - c | \leq \texttt{correlation\_window}.
+\]
+\end{itemize}
+
+\section*{Filters Applied During Path Selection}
+\begin{itemize}
+\item The code may apply two additional pre-selection filters when S\&P 500 data are available.
+\item First, it applies an \(H\)-period Kolmogorov-Smirnov filter. For each candidate path, the empirical distribution of simulated \(H\)-period returns is compared with the S\&P 500 \(H\)-period return distribution using a two-sample KS test.
+\item A candidate passes this filter if the KS \(p\)-value exceeds \(\alpha = 0.01\). In the code, this is treated as ``distributions are similar'' because the null of equal distributions is not rejected.
+\item Second, it applies a volatility filter. For each candidate path, the standard deviation of simulated \(H\)-period returns must lie within \(\pm 0.05\) of the S\&P 500 \(H\)-period standard deviation.
+\item When validation data are available, these two filters enter the admissible set used in path selection:
+\begin{itemize}
+\item correlation within the target window,
+\item KS pass on \(H\)-period returns,
+\item volatility pass.
+\end{itemize}
+\item If too few candidates satisfy all active filters, the stratified selector relaxes the admissible set by dropping the correlation and volatility requirements but still keeps the KS \(H\)-period filter when it is available.
+\item The non-stratified selector also falls back when too few paths pass the full screen, but it handles fallback through penalties rather than tercile quotas.
+\end{itemize}
+
+\section*{Ranking Rule}
+\begin{itemize}
+\item Each candidate path receives a score equal to its absolute distance from the target correlation:
+\[
+\text{score}_i = |\widehat{\mathrm{Corr}}_i - c|.
+\]
+\item If a volatility pass/fail indicator is available, the score adds a penalty of \(100\) for failing the volatility bound.
+\item If a path-specific volatility distance from the S\&P 500 benchmark is available, that absolute volatility distance is also added to the score.
+\item In the non-stratified fallback ranking, failing the \(H\)-period KS filter adds a much larger penalty of \(1000\), and failing the volatility bound adds \(100\). The selected paths are then the \(n\) paths with the smallest penalized score.
+\item Hence, the implemented ranking rule prioritizes matching the target correlation, but with strong preference for KS-compliant paths and moderate preference for volatility-compliant paths when benchmark data exist.
+\end{itemize}
+
+\section*{Stratified Path Selection}
+\begin{itemize}
+\item By default, \texttt{stratify\_predictable\_paths = True}, so the final selected predictable paths are chosen using a stratified rule rather than a simple global ranking.
+\item The stratification variable is the path-level mean of in-sample non-overlapping \(H\)-period returns:
+\[
+\bar r_i^{(H)} = \text{mean of } \texttt{returns\_h[H:T\_is:H, i]}.
+\]
+\item The full candidate pool is split into terciles according to this mean-return metric, using the empirical \(1/3\) and \(2/3\) quantiles of the metric across all candidate paths with non-missing values.
+\item The code then assigns approximately equal quotas across the three terciles. If the number of selected paths is not divisible by three, the first terciles receive the extra slots.
+\item Within each tercile, eligible paths are sorted by the selection score described above, and the best-scoring paths are taken up to the tercile quota.
+\item If some terciles do not provide enough eligible candidates, the remaining slots are filled from the remaining admissible candidates ranked by score.
+\item If the admissible pool is still too small, the remaining slots are filled from any candidate with non-missing correlation and non-missing stratification metric, again ranked by score.
+\item The final output therefore aims to combine target-correlation matching with broad representation across low-, medium-, and high-mean-return paths.
+\end{itemize}
+
+\section*{Post-Selection Validation Statistics}
+\begin{itemize}
+\item After the final predictable paths are selected, the code computes summary statistics for the selected \(H\)-period returns and annual returns pooled across selected paths: mean, standard deviation, minimum, maximum, and number of observations.
+\item If S\&P 500 data are available, the code also computes benchmark moments for annual and \(H\)-period returns.
+\item The following post-selection validation checks are then reported for each selected path:
+\begin{itemize}
+\item KS test for \(H\)-period returns versus S\&P 500 \(H\)-period returns,
+\item KS test for annual returns versus S\&P 500 annual returns,
+\item return-bounds check requiring the simulated minimum and maximum \(H\)-period returns to lie within the historical S\&P 500 minimum and maximum,
+\item volatility-bounds check requiring the simulated \(H\)-period volatility to lie within \(\pm 0.05\) of the S\&P 500 \(H\)-period volatility,
+\item first-order autocorrelation of the selected \(H\)-period return series.
+\end{itemize}
+\item The code also marks a path as ``fully compliant'' only if all four binary checks pass simultaneously: KS on \(H\)-period returns, KS on annual returns, return bounds, and volatility bounds.
+\item These post-selection validation measures are reported to the user in the app, but only the \(H\)-period KS filter and the volatility filter affect the selection stage itself.
+\end{itemize}
+
+\section*{Regression Diagnostics Reported by the Code}
+\begin{itemize}
+\item For each selected path, the code runs two simple OLS regressions on the in-sample horizon observations used in the validation block.
+\item The first regression is the horizon return on a constant and the fitted predictive signal:
+\[
+r_t^{(H)} = a + \beta_s \hat r_{t,t+H} + u_t.
+\]
+\item The second regression is the horizon return on a constant and the lagged horizon return:
+\[
+r_t^{(H)} = a + \beta_{\ell} r_{t-H}^{(H)} + v_t.
+\]
+\item The code reports coefficients, \(p\)-values, and \(R^2\) values for both regressions.
+\item In the app, these regression outputs are summarized as:
+\begin{itemize}
+\item \(R^2(\text{signal})\): interpreted as variation explained by the predictive signal,
+\item \(R^2(\text{lag})\): interpreted as variation explained by past returns.
+\end{itemize}
+\item These regressions are diagnostic outputs. They do not feed back into the path-selection algorithm.
+\end{itemize}
+
+\section*{Handling of S\&P 500 Reference Data}
+\begin{itemize}
+\item When validation is enabled in the app, the simulator attempts to load the Excel file supplied by the user or, if absent, a default file path inside the repository.
+\item The code reads annual returns from the first column whose name contains \texttt{Return (A)} but not \texttt{Y}.
+\item For horizon returns, the code first looks for a column whose name contains \texttt{\{H\}Y Return}. If such a column is missing, it constructs horizon returns by taking arithmetic averages of \(H\) consecutive annual returns in a rolling window.
+\item Therefore, the benchmark \(H\)-period series used for validation may come either from a precomputed horizon-return column or from rolling arithmetic averages of annual returns, depending on the contents of the Excel file.
+\end{itemize}
+
+\section*{Implementation Notes Useful for Writing the Paper}
+\begin{itemize}
+\item The simulated horizon returns are non-overlapping in the generated paths.
+\item The predictive object used in the main screening statistics is not the raw AR(1) state itself but the fitted expected horizon return \(\mu + b' x_t\).
+\item The selection routine uses a large candidate pool and then retains a smaller subset of paths that best matches the target design and the optional historical-data filters.
+\item Annual return innovations and signal innovations are jointly Gaussian with user-set contemporaneous correlation.
+\item The code is written for arithmetic returns throughout; it does not compound into geometric multi-year returns inside the simulation engine.
+\end{itemize}
+
+\end{document}

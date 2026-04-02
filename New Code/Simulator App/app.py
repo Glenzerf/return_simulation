@@ -26,22 +26,26 @@ RETURN_LINE_STYLE = dict(color='#ef4444', width=2.5)
 SIGNAL_LINE_STYLE = dict(color='#3b82f6', width=2.5, dash='6px,3px')
 
 
-def compute_shared_y_range(results, config):
-    """Use one y-axis range across all path charts."""
+def compute_shared_y_range(results, config, n_display_paths: int):
+    """Use one y-axis range across only the displayed path charts."""
     if results.get('returns_pred') is None or results.get('signal_pred') is None:
         return [-20, 20]
 
     H = config.time_horizon
     T_is = config.years_insample
+    n_paths = min(n_display_paths, results['returns_pred'].shape[1])
+
+    if n_paths <= 0:
+        return [-20, 20]
 
     values = [
-        results['returns_pred'][H:T_is+1:H, :] * 100,
-        results['returns_pred'][0:T_is+H+1:H, :] * 100,
-        results['signal_pred'][0:T_is+H+1:H, :] * 100,
+        results['returns_pred'][H:T_is+1:H, :n_paths] * 100,
+        results['returns_pred'][0:T_is+H+1:H, :n_paths] * 100,
+        results['signal_pred'][0:T_is+H+1:H, :n_paths] * 100,
     ]
     y_all = np.concatenate([arr.reshape(-1) for arr in values if arr.size > 0])
-    y_min = np.floor(np.nanmin(y_all) / 10) * 10 - 10
-    y_max = np.ceil(np.nanmax(y_all) / 10) * 10 + 10
+    y_min = np.floor(np.nanmin(y_all) / 5) * 5 - 5
+    y_max = np.ceil(np.nanmax(y_all) / 5) * 5 + 5
     return [y_min, y_max]
 
 
@@ -716,7 +720,7 @@ Random Seed:            {config.random_seed}
                 ("Return Bounds", pass_rates.get('return_bounds', 0),
                     "Checks if min/max returns fall within S&P 500 historical range"),
                 ("Volatility Bounds", pass_rates.get('volatility_bounds', 0),
-                    "Checks if return volatility is within ±5% of S&P 500 volatility"),
+                    "Checks if return volatility is within ±1% of S&P 500 volatility"),
             ]
             
             for check_name, rate, help_text in checks:
@@ -788,6 +792,7 @@ Random Seed:            {config.random_seed}
         
         # Build dataframe
         path_details = []
+        selected_terciles = results.get('selection', {}).get('selected_terciles', [])
         
         # Predictable paths
         if 'predictable' in validation and results['correlations_pred'] is not None:
@@ -796,6 +801,7 @@ Random Seed:            {config.random_seed}
                 reg = val_pred['regressions'][i]
                 path_details.append({
                     'Path ID': i + 1,
+                    'Return Percentile': selected_terciles[i] if i < len(selected_terciles) else '',
                     'Correlation': f"{results['correlations_pred'][i]:.4f}",
                     'β(signal)': f"{reg['beta_signal']:.4f}" if not np.isnan(reg['beta_signal']) else 'NaN',
                     'p(signal)': f"{reg['pval_signal']:.4f}" if not np.isnan(reg['pval_signal']) else 'NaN',
@@ -803,11 +809,11 @@ Random Seed:            {config.random_seed}
                     'β(lagged return)': f"{reg['beta_lag']:.4f}" if not np.isnan(reg['beta_lag']) else 'NaN',
                     'p(lagged return)': f"{reg['pval_lag']:.4f}" if not np.isnan(reg['pval_lag']) else 'NaN',
                     'R²(lagged return)': f"{reg['r2_lag']:.4f}" if not np.isnan(reg['r2_lag']) else 'NaN',
-                    'KS(h-yr)': '✓' if val_pred['ks_h_pass'][i] else '✗',
-                    'KS(ann)': '✓' if val_pred['ks_annual_pass'][i] else '✗',
-                    'Bounds': '✓' if val_pred['bounds_pass'][i] else '✗',
-                    'Vol': '✓' if val_pred['volatility_pass'][i] else '✗',
-                    'Status': 'Full ✓' if val_pred['full_compliant'][i] else 'Partial'
+                    'KS(h-yr)': 'Y' if val_pred['ks_h_pass'][i] else 'N',
+                    'KS(ann)': 'Y' if val_pred['ks_annual_pass'][i] else 'N',
+                    'Bounds': 'Y' if val_pred['bounds_pass'][i] else 'N',
+                    'Vol': 'Y' if val_pred['volatility_pass'][i] else 'N',
+                    'Status': 'Y' if val_pred['full_compliant'][i] else 'N'
                 })
         
 
@@ -849,7 +855,8 @@ Random Seed:            {config.random_seed}
     
     # Sample paths visualization with Regression Statistics (PRIORITY 5)
     st.subheader("Sample Paths")
-    shared_y_range = compute_shared_y_range(results, config)
+    n_display_paths = min(3, config.n_paths_predictable)
+    shared_y_range = compute_shared_y_range(results, config, n_display_paths)
 
     if config.n_paths_predictable > 0 and st.session_state.get('show_sample_paths', False):
         for i in range(min(3, config.n_paths_predictable)):
@@ -958,6 +965,7 @@ Random Seed:            {config.random_seed}
 
                 time_labels = np.arange(-40, 1)
                 rows = []
+                selected_terciles = results.get('selection', {}).get('selected_terciles', [])
 
                 for i in range(results['returns_pred'].shape[1]):
 
@@ -967,7 +975,10 @@ Random Seed:            {config.random_seed}
                     # Fitted signal exactly as shown in the graph
                     fitted_signal = results['signal_pred'][0:T_is + H + 1:H, i]
 
-                    row = {"Path_ID": f"path_{i+1}"}
+                    row = {
+                        "Path_ID": f"path_{i+1}",
+                        "return_percentile": selected_terciles[i] if i < len(selected_terciles) else ""
+                    }
 
                     # Add signal columns
                     for t, val in zip(time_labels, fitted_signal):

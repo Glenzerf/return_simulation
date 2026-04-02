@@ -43,6 +43,7 @@ class SimulationConfig:
     # Simulation settings
     n_simulations: int = 10000   # Generate this many before selecting best
     random_seed: int = 42        # For reproducibility
+    stratify_predictable_paths: bool = True
     
     # Validation settings
     validate_with_spx: bool = True
@@ -320,17 +321,156 @@ class PathSimulator:
 
         return summary
 
+    def calculate_path_return_metric(self, returns_h: np.ndarray) -> np.ndarray:
+        """Compute one return summary per path for stratified selection."""
+        H = self.config.time_horizon
+        h_values = returns_h[H:self.T_is:H, :]
+        return np.nanmean(h_values, axis=0)
+
+    def _compute_selection_scores(
+        self,
+        correlations: np.ndarray,
+        target: float,
+        volatility_pass: Optional[np.ndarray] = None,
+        volatility_distance: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        """Build the same path-quality score used by the non-stratified selector."""
+        scores = np.abs(correlations - target).astype(float)
+        scores[np.isnan(correlations)] = 999.0
+
+        if volatility_pass is not None:
+            scores = scores + np.where(volatility_pass, 0.0, 100.0)
+
+        if volatility_distance is not None:
+            scores = scores + volatility_distance
+
+        return scores
+
+    def calculate_ks_h_pass_mask(self, returns_h: np.ndarray) -> np.ndarray:
+        """True for paths that do not reject the H-year KS null against the SPX reference."""
+        if self.spx_returns_h is None:
+            return np.ones(returns_h.shape[1], dtype=bool)
+
+        H = self.config.time_horizon
+        pass_mask = np.zeros(returns_h.shape[1], dtype=bool)
+
+        for i in range(returns_h.shape[1]):
+            r_h = returns_h[H:self.T_is:H, i]
+            r_h = r_h[~np.isnan(r_h)]
+
+            if len(r_h) < 3:
+                pass_mask[i] = False
+                continue
+
+            _, ks_h_pval = stats.ks_2samp(r_h, self.spx_returns_h)
+            pass_mask[i] = ks_h_pval > self.config.ks_alpha
+
+        return pass_mask
+
+    def select_best_paths_stratified(
+        self,
+        correlations: np.ndarray,
+        returns_h: np.ndarray,
+        target: float,
+        window: float,
+        n_select: int,
+        ks_h_pass: Optional[np.ndarray] = None,
+        volatility_pass: Optional[np.ndarray] = None,
+        volatility_distance: Optional[np.ndarray] = None,
+    ) -> Tuple[np.ndarray, np.ndarray, Dict[str, object]]:
+        """
+        Select paths with equal representation from return terciles.
+
+        Tercile cutoffs are defined from the full candidate-path return metric
+        distribution for the run, not from the final selected subset.
+        """
+        path_metric = self.calculate_path_return_metric(returns_h)
+        metric_mask = ~np.isnan(path_metric)
+        corr_mask = ~np.isnan(correlations)
+
+        valid_mask = corr_mask & metric_mask & (np.abs(correlations - target) <= window)
+        if ks_h_pass is not None:
+            valid_mask &= ks_h_pass
+        if volatility_pass is not None:
+            valid_mask &= volatility_pass
+
+        candidate_mask = valid_mask.copy()
+        if candidate_mask.sum() < n_select:
+            candidate_mask = corr_mask & metric_mask
+            if ks_h_pass is not None:
+                candidate_mask &= ks_h_pass
+
+        scores = self._compute_selection_scores(
+            correlations,
+            target,
+            volatility_pass=volatility_pass,
+            volatility_distance=volatility_distance,
+        )
+
+        cutoffs = np.quantile(path_metric[metric_mask], [1 / 3, 2 / 3])
+        terciles = np.digitize(path_metric, cutoffs, right=True)
+
+        base_quota = n_select // 3
+        quotas = [base_quota, base_quota, base_quota]
+        for i in range(n_select - sum(quotas)):
+            quotas[i] += 1
+
+        selected_indices: List[int] = []
+        selected_set = set()
+        tercile_counts = []
+
+        for tercile, quota in enumerate(quotas):
+            eligible = np.where(candidate_mask & (terciles == tercile))[0]
+            eligible_sorted = eligible[np.argsort(scores[eligible])]
+            chosen = eligible_sorted[:quota].tolist()
+            selected_indices.extend(chosen)
+            selected_set.update(chosen)
+            tercile_counts.append(len(chosen))
+
+        if len(selected_indices) < n_select:
+            remaining = np.where(candidate_mask & ~np.isin(np.arange(len(correlations)), list(selected_set)))[0]
+            remaining_sorted = remaining[np.argsort(scores[remaining])]
+            needed = n_select - len(selected_indices)
+            fill = remaining_sorted[:needed].tolist()
+            selected_indices.extend(fill)
+            selected_set.update(fill)
+
+        if len(selected_indices) < n_select:
+            remaining_any = np.where(corr_mask & metric_mask & ~np.isin(np.arange(len(correlations)), list(selected_set)))[0]
+            remaining_any_sorted = remaining_any[np.argsort(scores[remaining_any])]
+            needed = n_select - len(selected_indices)
+            selected_indices.extend(remaining_any_sorted[:needed].tolist())
+
+        selected_indices = np.array(selected_indices[:n_select], dtype=int)
+        selected_corrs = correlations[selected_indices]
+        selected_terciles = terciles[selected_indices]
+
+        metadata = {
+            'enabled': True,
+            'metric': 'mean_h_period_return',
+            'cutoffs': [float(cutoffs[0]), float(cutoffs[1])],
+            'quotas': quotas,
+            'selected_counts': [int(np.sum(selected_terciles == i)) for i in range(3)],
+            'selected_terciles': [int(x) + 1 for x in selected_terciles.tolist()],
+            'candidate_count': int(candidate_mask.sum()),
+            'used_fallback_pool': bool(valid_mask.sum() < n_select),
+        }
+        return selected_indices, selected_corrs, metadata
+
     def select_best_paths(
         self,
         correlations: np.ndarray,
         target: float,
         window: float,
         n_select: int,
+        ks_h_pass: Optional[np.ndarray] = None,
         volatility_pass: Optional[np.ndarray] = None,
         volatility_distance: Optional[np.ndarray] = None,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """Select paths with correlation closest to target, prioritizing volatility-compliant paths."""
         valid_mask = ~np.isnan(correlations) & (np.abs(correlations - target) <= window)
+        if ks_h_pass is not None:
+            valid_mask &= ks_h_pass
         if volatility_pass is not None:
             valid_mask &= volatility_pass
         valid_indices = np.where(valid_mask)[0]
@@ -339,13 +479,17 @@ class PathSimulator:
         if len(valid_indices) < n_select:
             distances = np.abs(correlations - target)
             distances[np.isnan(correlations)] = 999
+            if ks_h_pass is not None:
+                ks_penalty = np.where(ks_h_pass, 0.0, 1000.0)
+            else:
+                ks_penalty = np.zeros_like(distances)
             if volatility_pass is not None:
                 vol_penalty = np.where(volatility_pass, 0.0, 100.0)
             else:
                 vol_penalty = np.zeros_like(distances)
             if volatility_distance is None:
                 volatility_distance = np.zeros_like(distances)
-            selected_indices = np.argsort(vol_penalty + distances + volatility_distance)[:n_select]
+            selected_indices = np.argsort(ks_penalty + vol_penalty + distances + volatility_distance)[:n_select]
         else:
             distances = np.abs(valid_corrs - target)
             if volatility_distance is not None:
@@ -506,7 +650,7 @@ class PathSimulator:
         
         return results
     
-    def validate_volatility_bounds(self, returns_h: np.ndarray, spx_std: float, tolerance: float = 0.05) -> List[bool]:
+    def validate_volatility_bounds(self, returns_h: np.ndarray, spx_std: float, tolerance: float = 0.01) -> List[bool]:
         """Check if return volatility is within acceptable range of SPX"""
         H = self.config.time_horizon
         results = []
@@ -530,6 +674,7 @@ class PathSimulator:
         # Initialize variables
         returns_pred = signal_pred_actual = signal_pred = returns_pred_annual = None
         idx_pred = selected_corr_pred = None
+        selection_metadata = {}
         
         if self.config.n_paths_predictable > 0:
             print("Generating predictable paths...")
@@ -543,21 +688,37 @@ class PathSimulator:
         # Calculate correlations and select paths
 
         corr_pred = self.calculate_correlation(returns_pred, signal_pred)
+        ks_h_pass_pred = None
         vol_pass_pred = None
         vol_distance_pred = None
         if self.config.validate_with_spx and self.spx_returns_h is not None:
+            ks_h_pass_pred = self.calculate_ks_h_pass_mask(returns_pred)
             spx_std = self.spx_returns_h.std()
             path_vol_pred = self.calculate_path_volatility(returns_pred)
             vol_pass_pred = np.array(self.validate_volatility_bounds(returns_pred, spx_std))
             vol_distance_pred = np.abs(path_vol_pred - spx_std)
-        idx_pred, selected_corr_pred = self.select_best_paths(
-            corr_pred,
-            self.config.target_correlation,
-            self.config.correlation_window,
-            self.config.n_paths_predictable,
-            volatility_pass=vol_pass_pred,
-            volatility_distance=vol_distance_pred,
-        )
+        if self.config.stratify_predictable_paths:
+            idx_pred, selected_corr_pred, selection_metadata = self.select_best_paths_stratified(
+                corr_pred,
+                returns_pred,
+                self.config.target_correlation,
+                self.config.correlation_window,
+                self.config.n_paths_predictable,
+                ks_h_pass=ks_h_pass_pred,
+                volatility_pass=vol_pass_pred,
+                volatility_distance=vol_distance_pred,
+            )
+        else:
+            idx_pred, selected_corr_pred = self.select_best_paths(
+                corr_pred,
+                self.config.target_correlation,
+                self.config.correlation_window,
+                self.config.n_paths_predictable,
+                ks_h_pass=ks_h_pass_pred,
+                volatility_pass=vol_pass_pred,
+                volatility_distance=vol_distance_pred,
+            )
+            selection_metadata = {'enabled': False}
         
         # Extract selected paths
         returns_pred_selected = signal_pred_actual_selected = signal_pred_selected = returns_pred_annual_selected = None
@@ -650,6 +811,7 @@ class PathSimulator:
             'signal_pred_actual': signal_pred_actual_selected,
             'signal_pred': signal_pred_selected,
             'correlations_pred': selected_corr_pred,
+            'selection': selection_metadata,
             'validation': validation_results,
             'config': self.config
         }
