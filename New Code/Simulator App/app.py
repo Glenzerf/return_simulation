@@ -252,7 +252,7 @@ with st.sidebar:
         min_value=1,
         max_value=50,
         value=preset_params["n_paths_predictable"],
-        help="Set to 0 to skip predictable paths"
+        help="Number of predictable paths to retain after correlation-based selection"
     )
     
     st.divider()
@@ -535,7 +535,7 @@ if st.session_state.results is not None:
             st.code(f"""
 Time Horizon (H):       {config.time_horizon}
 Target Correlation:     {config.target_correlation}
-Path Configuration:     {config.n_paths_predictable} Pred 
+Predictable Paths:      {config.n_paths_predictable}
 Mean Return (mu):       {config.mu}
 Return Vol (sigma_eps): {config.sigma_eps}
 Persistence (phi):      {config.phi}
@@ -797,12 +797,20 @@ Random Seed:            {config.random_seed}
         # Predictable paths
         if 'predictable' in validation and results['correlations_pred'] is not None:
             val_pred = validation['predictable']
+            H = config.time_horizon
+            T_is = config.years_insample
             for i in range(len(results['correlations_pred'])):
                 reg = val_pred['regressions'][i]
+                h_returns = results['returns_pred'][H:T_is + H + 1:H, i]
+                h_returns_clean = h_returns[~np.isnan(h_returns)]
                 path_details.append({
                     'Path ID': i + 1,
                     'Return Percentile': selected_terciles[i] if i < len(selected_terciles) else '',
                     'Correlation': f"{results['correlations_pred'][i]:.4f}",
+                    'Return Min': float(np.min(h_returns_clean)) if len(h_returns_clean) > 0 else np.nan,
+                    'Return Max': float(np.max(h_returns_clean)) if len(h_returns_clean) > 0 else np.nan,
+                    'Return Mean': float(np.mean(h_returns_clean)) if len(h_returns_clean) > 0 else np.nan,
+                    'Return Std': float(np.std(h_returns_clean)) if len(h_returns_clean) > 1 else np.nan,
                     'β(signal)': f"{reg['beta_signal']:.4f}" if not np.isnan(reg['beta_signal']) else 'NaN',
                     'p(signal)': f"{reg['pval_signal']:.4f}" if not np.isnan(reg['pval_signal']) else 'NaN',
                     'R²(signal)': f"{reg['r2_signal']:.4f}" if not np.isnan(reg['r2_signal']) else 'NaN',
@@ -971,13 +979,18 @@ Random Seed:            {config.random_seed}
 
                     # 41 aligned H-year returns, including the one-period-ahead return at t=0
                     h_returns = results['returns_pred'][H:T_is + H + 1:H, i]
+                    h_returns_clean = h_returns[~np.isnan(h_returns)]
 
                     # Fitted signal exactly as shown in the graph
                     fitted_signal = results['signal_pred'][0:T_is + H + 1:H, i]
 
                     row = {
                         "Path_ID": f"path_{i+1}",
-                        "return_percentile": selected_terciles[i] if i < len(selected_terciles) else ""
+                        "return_percentile": selected_terciles[i] if i < len(selected_terciles) else "",
+                        "return_min": float(np.min(h_returns_clean)) if len(h_returns_clean) > 0 else np.nan,
+                        "return_max": float(np.max(h_returns_clean)) if len(h_returns_clean) > 0 else np.nan,
+                        "return_mean": float(np.mean(h_returns_clean)) if len(h_returns_clean) > 0 else np.nan,
+                        "return_std": float(np.std(h_returns_clean)) if len(h_returns_clean) > 1 else np.nan,
                     }
 
                     # Add signal columns

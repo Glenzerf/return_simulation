@@ -3,7 +3,7 @@ Return Path Simulation Engine for Behavioral Finance Experiment
 Based on Andries et al. (2025) methodology
 
 This module provides the core simulation functionality for generating
-predictable and i.i.d. return paths with a predictive signal.
+predictable return paths with a predictive signal.
 """
 
 import numpy as np
@@ -86,7 +86,11 @@ class PathSimulator:
         self.T = self.T_is + self.T_oos + 1                                   # = 41H + 1
         
         # Average effect of the persistent signal on the next H-period average return
-        self.b_prime_factor = sum(config.phi**i for i in range(config.time_horizon)) / config.time_horizon
+        self.horizon_expectation_weights = np.array(
+            [config.phi**i for i in range(config.time_horizon)],
+            dtype=float
+        ) / config.time_horizon
+        self.b_prime_factor = float(np.sum(self.horizon_expectation_weights))
         self.var_signal = config.sigma_delta**2 / (1 - config.phi**2)
         self.sigma_eps_effective = config.sigma_eps
         self.B = 0.0
@@ -105,24 +109,56 @@ class PathSimulator:
         self._calibrate_process_parameters()
 
     def _calibrate_process_parameters(self):
-        """Calibrate the predictable process to the target correlation and H-period volatility."""
-        target_corr = self.config.target_correlation
-        target_r2 = target_corr ** 2
+        """Set model-implied annual process parameters without using benchmark moments."""
+        self.sigma_eps_effective = self.config.sigma_eps
+        self.B = self._solve_annual_return_loading(self.config.target_correlation)
 
-        if self.spx_returns_h is not None and len(self.spx_returns_h) > 1:
-            target_h_std = float(np.std(self.spx_returns_h))
-            beta_h = target_corr * target_h_std / np.sqrt(self.var_signal)
-            noise_var_h = max(target_h_std**2 * (1 - target_r2), 1e-12)
+    def _solve_annual_return_loading(self, target_corr: float) -> float:
+        """
+        Solve for the annual return loading B so that the correlation between the
+        next H-period return and its model-implied conditional expectation equals
+        the requested target correlation.
+        """
+        if target_corr <= 0:
+            return 0.0
 
-            self.sigma_eps_effective = np.sqrt(noise_var_h * self.config.time_horizon)
-            self.B = beta_h / self.b_prime_factor
-            return
+        c2 = target_corr ** 2
+        H = self.config.time_horizon
+        phi = self.config.phi
+        sigma_delta = self.config.sigma_delta
+        sigma_eps = self.sigma_eps_effective
+        rho = self.config.rho
 
-        noise_var_h = self.sigma_eps_effective**2 / self.config.time_horizon
-        scaling = max(1 - target_r2, 1e-12)
-        self.B = np.sqrt(
-            (target_r2 / scaling) * noise_var_h / (self.var_signal * self.b_prime_factor**2)
+        a_h = self.b_prime_factor
+        latent_weights = np.array(
+            [
+                sum(phi**m for m in range(H - k)) / H
+                for k in range(1, H)
+            ],
+            dtype=float
         )
+
+        signal_term = (a_h ** 2) * self.var_signal
+        state_noise_term = sigma_delta**2 * float(np.sum(latent_weights**2))
+        return_noise_term = sigma_eps**2 / H
+        cross_term = 2 * rho * sigma_delta * sigma_eps * float(np.sum(latent_weights)) / H
+
+        quad_a = signal_term - c2 * (signal_term + state_noise_term)
+        quad_b = -c2 * cross_term
+        quad_c = -c2 * return_noise_term
+
+        if np.isclose(quad_a, 0.0):
+            if np.isclose(quad_b, 0.0):
+                raise ValueError("Unable to identify annual return loading from the supplied parameters")
+            root = -quad_c / quad_b
+            return float(max(root, 0.0))
+
+        roots = np.roots([quad_a, quad_b, quad_c])
+        positive_real_roots = [float(root.real) for root in roots if np.isreal(root) and root.real >= 0]
+        if not positive_real_roots:
+            raise ValueError("No admissible annual return loading matches the requested target correlation")
+
+        return min(positive_real_roots)
     
     def _load_spx_data(self):
         """Load S&P 500 data for validation"""
@@ -226,41 +262,66 @@ class PathSimulator:
         shock2 = M[:, 1, :] * sig2
         return shock1, shock2
     
-    def simulate_predictable_paths(self, N: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """Simulate predictable return paths"""
+    def _simulate_annual_state_process(self, N: int) -> np.ndarray:
+        """Simulate the annual latent state process."""
         T = self.T
-        H = self.config.time_horizon
-        
         signal = np.zeros((T, N))
-        # Now make sure signal doesn't always start at 6.07%
         signal[0, :] = np.random.normal(
             loc=0,
             scale=self.config.sigma_delta / np.sqrt(1 - self.config.phi**2),
             size=N
-)
+        )
+
+        delta = np.random.normal(loc=0, scale=self.config.sigma_delta, size=(T, N))
+        for t in range(1, T):
+            signal[t, :] = self.config.phi * signal[t-1, :] + delta[t, :]
+
+        return signal
+
+    def compute_expected_horizon_return(self, annual_state: np.ndarray) -> np.ndarray:
+        """
+        Compute the displayed horizon-level signal as the model-implied
+        conditional expectation of the next H-period average return.
+        """
+        T, N = annual_state.shape
+        H = self.config.time_horizon
+        signal_display = np.full((T, N), np.nan)
+
+        for t in range(0, T - H, H):
+            signal_display[t, :] = self.config.mu + self.B * self.b_prime_factor * annual_state[t, :]
+
+        return signal_display
+
+    def simulate_predictable_paths(self, N: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Simulate predictable paths from the annual DGP."""
+        T = self.T
+        H = self.config.time_horizon
+
+        annual_state = np.zeros((T, N))
+        annual_state[0, :] = np.random.normal(
+            loc=0,
+            scale=self.config.sigma_delta / np.sqrt(1 - self.config.phi**2),
+            size=N
+        )
         returns_annual = np.zeros((T, N))
         returns_h = np.zeros((T, N))
-        signal_fitted = np.zeros((T, N))
         
         delta, eps = self.generate_correlated_shocks(
             T, N, self.config.rho, self.config.sigma_delta, self.sigma_eps_effective
         )
         
         for t in range(1, T):
-            signal[t, :] = self.config.phi * signal[t-1, :] + delta[t, :] # state variable estimated from demeaned log dividend yield; equation B.1
+            annual_state[t, :] = self.config.phi * annual_state[t-1, :] + delta[t, :]
         
         for t in range(1, T):
-            returns_annual[t, :] = self.config.mu + self.B * signal[t-1, :] + eps[t, :] # annual arithmetic return
+            returns_annual[t, :] = self.config.mu + self.B * annual_state[t-1, :] + eps[t, :]
         
         for t in range(H, T, H):
-            returns_h[t, :] = np.sum(returns_annual[t-(H-1):t+1, :], axis=0) / H # arithmetic average of H annual returns
-        
-        b_prime = self.B * self.b_prime_factor
-        for t in range(0, T-H, H):
-            signal_fitted[t, :] = self.config.mu + b_prime * signal[t, :]
-        
-        return returns_h, signal, signal_fitted, returns_annual
-        
+            returns_h[t, :] = np.mean(returns_annual[t-(H-1):t+1, :], axis=0)
+
+        signal_fitted = self.compute_expected_horizon_return(annual_state)
+        return returns_h, annual_state, signal_fitted, returns_annual
+
     def calculate_correlation(self, returns_h: np.ndarray, signal_h: np.ndarray) -> np.ndarray:
         """Calculate correlation between h-year returns and lagged signal"""
         H = self.config.time_horizon
@@ -278,18 +339,6 @@ class PathSimulator:
         
         return np.array(correlations)
     
-    def calculate_path_volatility(self, returns_h: np.ndarray) -> np.ndarray:
-        """Calculate H-period return volatility for each path."""
-        H = self.config.time_horizon
-        volatilities = []
-        
-        for i in range(returns_h.shape[1]):
-            r = returns_h[H:self.T_is:H, i]
-            r = r[~np.isnan(r)]
-            volatilities.append(r.std() if len(r) >= 2 else np.nan)
-        
-        return np.array(volatilities)
-
     def summarize_simulated_returns(self, returns_h: np.ndarray, returns_annual: np.ndarray) -> Dict[str, Dict[str, float]]:
         """Summarize selected simulated H-period and annual returns across all paths."""
         H = self.config.time_horizon
@@ -327,25 +376,6 @@ class PathSimulator:
         h_values = returns_h[H:self.T_is:H, :]
         return np.nanmean(h_values, axis=0)
 
-    def _compute_selection_scores(
-        self,
-        correlations: np.ndarray,
-        target: float,
-        volatility_pass: Optional[np.ndarray] = None,
-        volatility_distance: Optional[np.ndarray] = None,
-    ) -> np.ndarray:
-        """Build the same path-quality score used by the non-stratified selector."""
-        scores = np.abs(correlations - target).astype(float)
-        scores[np.isnan(correlations)] = 999.0
-
-        if volatility_pass is not None:
-            scores = scores + np.where(volatility_pass, 0.0, 100.0)
-
-        if volatility_distance is not None:
-            scores = scores + volatility_distance
-
-        return scores
-
     def calculate_ks_h_pass_mask(self, returns_h: np.ndarray) -> np.ndarray:
         """True for paths that do not reject the H-year KS null against the SPX reference."""
         if self.spx_returns_h is None:
@@ -375,39 +405,33 @@ class PathSimulator:
         window: float,
         n_select: int,
         ks_h_pass: Optional[np.ndarray] = None,
-        volatility_pass: Optional[np.ndarray] = None,
-        volatility_distance: Optional[np.ndarray] = None,
     ) -> Tuple[np.ndarray, np.ndarray, Dict[str, object]]:
         """
         Select paths with equal representation from return terciles.
 
-        Tercile cutoffs are defined from the full candidate-path return metric
-        distribution for the run, not from the final selected subset.
+        If SPX validation is available, only KS-passing paths are eligible.
         """
         path_metric = self.calculate_path_return_metric(returns_h)
         metric_mask = ~np.isnan(path_metric)
         corr_mask = ~np.isnan(correlations)
 
-        valid_mask = corr_mask & metric_mask & (np.abs(correlations - target) <= window)
+        candidate_mask = corr_mask & metric_mask
         if ks_h_pass is not None:
-            valid_mask &= ks_h_pass
-        if volatility_pass is not None:
-            valid_mask &= volatility_pass
+            candidate_mask &= ks_h_pass
 
-        candidate_mask = valid_mask.copy()
         if candidate_mask.sum() < n_select:
-            candidate_mask = corr_mask & metric_mask
-            if ks_h_pass is not None:
-                candidate_mask &= ks_h_pass
+            raise ValueError(
+                f"Only {int(candidate_mask.sum())} paths satisfy the KS filter and have valid correlations, "
+                f"but {n_select} are required. Increase n_simulations or relax the setup."
+            )
 
-        scores = self._compute_selection_scores(
-            correlations,
-            target,
-            volatility_pass=volatility_pass,
-            volatility_distance=volatility_distance,
-        )
+        window_mask = candidate_mask & (np.abs(correlations - target) <= window)
+        working_mask = window_mask if window_mask.sum() >= n_select else candidate_mask
 
-        cutoffs = np.quantile(path_metric[metric_mask], [1 / 3, 2 / 3])
+        distances = np.abs(correlations - target).astype(float)
+        distances[~candidate_mask] = np.inf
+
+        cutoffs = np.quantile(path_metric[candidate_mask], [1 / 3, 2 / 3])
         terciles = np.digitize(path_metric, cutoffs, right=True)
 
         base_quota = n_select // 3
@@ -417,27 +441,25 @@ class PathSimulator:
 
         selected_indices: List[int] = []
         selected_set = set()
-        tercile_counts = []
 
         for tercile, quota in enumerate(quotas):
-            eligible = np.where(candidate_mask & (terciles == tercile))[0]
-            eligible_sorted = eligible[np.argsort(scores[eligible])]
+            eligible = np.where(working_mask & (terciles == tercile))[0]
+            eligible_sorted = eligible[np.argsort(distances[eligible])]
             chosen = eligible_sorted[:quota].tolist()
             selected_indices.extend(chosen)
             selected_set.update(chosen)
-            tercile_counts.append(len(chosen))
 
         if len(selected_indices) < n_select:
-            remaining = np.where(candidate_mask & ~np.isin(np.arange(len(correlations)), list(selected_set)))[0]
-            remaining_sorted = remaining[np.argsort(scores[remaining])]
+            remaining = np.where(working_mask & ~np.isin(np.arange(len(correlations)), list(selected_set)))[0]
+            remaining_sorted = remaining[np.argsort(distances[remaining])]
             needed = n_select - len(selected_indices)
             fill = remaining_sorted[:needed].tolist()
             selected_indices.extend(fill)
             selected_set.update(fill)
 
         if len(selected_indices) < n_select:
-            remaining_any = np.where(corr_mask & metric_mask & ~np.isin(np.arange(len(correlations)), list(selected_set)))[0]
-            remaining_any_sorted = remaining_any[np.argsort(scores[remaining_any])]
+            remaining_any = np.where(candidate_mask & ~np.isin(np.arange(len(correlations)), list(selected_set)))[0]
+            remaining_any_sorted = remaining_any[np.argsort(distances[remaining_any])]
             needed = n_select - len(selected_indices)
             selected_indices.extend(remaining_any_sorted[:needed].tolist())
 
@@ -453,7 +475,10 @@ class PathSimulator:
             'selected_counts': [int(np.sum(selected_terciles == i)) for i in range(3)],
             'selected_terciles': [int(x) + 1 for x in selected_terciles.tolist()],
             'candidate_count': int(candidate_mask.sum()),
-            'used_fallback_pool': bool(valid_mask.sum() < n_select),
+            'window_candidate_count': int(window_mask.sum()),
+            'used_window': bool(window_mask.sum() >= n_select),
+            'selection_rule': 'stratified_tercile_absolute_correlation_distance',
+            'ks_filter_applied': bool(ks_h_pass is not None),
         }
         return selected_indices, selected_corrs, metadata
 
@@ -464,41 +489,44 @@ class PathSimulator:
         window: float,
         n_select: int,
         ks_h_pass: Optional[np.ndarray] = None,
-        volatility_pass: Optional[np.ndarray] = None,
-        volatility_distance: Optional[np.ndarray] = None,
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        """Select paths with correlation closest to target, prioritizing volatility-compliant paths."""
+    ) -> Tuple[np.ndarray, np.ndarray, Dict[str, object]]:
+        """Select paths using only closeness to the target correlation."""
         valid_mask = ~np.isnan(correlations) & (np.abs(correlations - target) <= window)
         if ks_h_pass is not None:
             valid_mask &= ks_h_pass
-        if volatility_pass is not None:
-            valid_mask &= volatility_pass
         valid_indices = np.where(valid_mask)[0]
         valid_corrs = correlations[valid_mask]
         
         if len(valid_indices) < n_select:
-            distances = np.abs(correlations - target)
-            distances[np.isnan(correlations)] = 999
+            candidate_mask = ~np.isnan(correlations)
             if ks_h_pass is not None:
-                ks_penalty = np.where(ks_h_pass, 0.0, 1000.0)
-            else:
-                ks_penalty = np.zeros_like(distances)
-            if volatility_pass is not None:
-                vol_penalty = np.where(volatility_pass, 0.0, 100.0)
-            else:
-                vol_penalty = np.zeros_like(distances)
-            if volatility_distance is None:
-                volatility_distance = np.zeros_like(distances)
-            selected_indices = np.argsort(ks_penalty + vol_penalty + distances + volatility_distance)[:n_select]
+                candidate_mask &= ks_h_pass
+            if candidate_mask.sum() < n_select:
+                raise ValueError(
+                    f"Only {int(candidate_mask.sum())} paths satisfy the KS filter and have valid correlations, "
+                    f"but {n_select} are required. Increase n_simulations or relax the setup."
+                )
+            distances = np.abs(correlations - target)
+            distances[~candidate_mask] = np.inf
+            selected_indices = np.argsort(distances)[:n_select]
+            used_window = False
         else:
             distances = np.abs(valid_corrs - target)
-            if volatility_distance is not None:
-                distances = distances + volatility_distance[valid_indices]
             sorted_idx = np.argsort(distances)[:n_select]
             selected_indices = valid_indices[sorted_idx]
+            used_window = True
         
         selected_corrs = correlations[selected_indices]
-        return selected_indices, selected_corrs
+        metadata = {
+            'enabled': False,
+            'target': float(target),
+            'window': float(window),
+            'window_candidate_count': int(valid_mask.sum()),
+            'used_window': used_window,
+            'selection_rule': 'absolute_correlation_distance',
+            'ks_filter_applied': bool(ks_h_pass is not None),
+        }
+        return selected_indices, selected_corrs, metadata
     
     def calculate_autocorrelation(self, returns_h: np.ndarray) -> np.ndarray:
         """Calculate lagged return autocorrelation"""
@@ -681,44 +709,34 @@ class PathSimulator:
             returns_pred, signal_pred_actual, signal_pred, returns_pred_annual = self.simulate_predictable_paths(
                 self.config.n_simulations
             )
-
         
         print("Calculating correlations and selecting best paths...")
         
         # Calculate correlations and select paths
+        corr_pred = None
+        if self.config.n_paths_predictable > 0:
+            corr_pred = self.calculate_correlation(returns_pred, signal_pred)
+            ks_h_pass_pred = None
+            if self.config.validate_with_spx and self.spx_returns_h is not None:
+                ks_h_pass_pred = self.calculate_ks_h_pass_mask(returns_pred)
 
-        corr_pred = self.calculate_correlation(returns_pred, signal_pred)
-        ks_h_pass_pred = None
-        vol_pass_pred = None
-        vol_distance_pred = None
-        if self.config.validate_with_spx and self.spx_returns_h is not None:
-            ks_h_pass_pred = self.calculate_ks_h_pass_mask(returns_pred)
-            spx_std = self.spx_returns_h.std()
-            path_vol_pred = self.calculate_path_volatility(returns_pred)
-            vol_pass_pred = np.array(self.validate_volatility_bounds(returns_pred, spx_std))
-            vol_distance_pred = np.abs(path_vol_pred - spx_std)
-        if self.config.stratify_predictable_paths:
-            idx_pred, selected_corr_pred, selection_metadata = self.select_best_paths_stratified(
-                corr_pred,
-                returns_pred,
-                self.config.target_correlation,
-                self.config.correlation_window,
-                self.config.n_paths_predictable,
-                ks_h_pass=ks_h_pass_pred,
-                volatility_pass=vol_pass_pred,
-                volatility_distance=vol_distance_pred,
-            )
-        else:
-            idx_pred, selected_corr_pred = self.select_best_paths(
-                corr_pred,
-                self.config.target_correlation,
-                self.config.correlation_window,
-                self.config.n_paths_predictable,
-                ks_h_pass=ks_h_pass_pred,
-                volatility_pass=vol_pass_pred,
-                volatility_distance=vol_distance_pred,
-            )
-            selection_metadata = {'enabled': False}
+            if self.config.stratify_predictable_paths:
+                idx_pred, selected_corr_pred, selection_metadata = self.select_best_paths_stratified(
+                    corr_pred,
+                    returns_pred,
+                    self.config.target_correlation,
+                    self.config.correlation_window,
+                    self.config.n_paths_predictable,
+                    ks_h_pass=ks_h_pass_pred,
+                )
+            else:
+                idx_pred, selected_corr_pred, selection_metadata = self.select_best_paths(
+                    corr_pred,
+                    self.config.target_correlation,
+                    self.config.correlation_window,
+                    self.config.n_paths_predictable,
+                    ks_h_pass=ks_h_pass_pred,
+                )
         
         # Extract selected paths
         returns_pred_selected = signal_pred_actual_selected = signal_pred_selected = returns_pred_annual_selected = None
@@ -752,20 +770,18 @@ class PathSimulator:
             spx_annual_mean = self.spx_returns_annual.mean()
             spx_annual_std = self.spx_returns_annual.std()
             
-            validation_results = {
-                'spx_stats': {
-                    'h_year': {
-                        'mean': float(spx_mean),
-                        'std': float(spx_std),
-                        'min': float(spx_min),
-                        'max': float(spx_max),
-                        'n_obs': len(self.spx_returns_h)
-                    },
-                    'annual': {
-                        'mean': float(spx_annual_mean),
-                        'std': float(spx_annual_std),
-                        'n_obs': len(self.spx_returns_annual)
-                    }
+            validation_results['spx_stats'] = {
+                'h_year': {
+                    'mean': float(spx_mean),
+                    'std': float(spx_std),
+                    'min': float(spx_min),
+                    'max': float(spx_max),
+                    'n_obs': len(self.spx_returns_h)
+                },
+                'annual': {
+                    'mean': float(spx_annual_mean),
+                    'std': float(spx_annual_std),
+                    'n_obs': len(self.spx_returns_annual)
                 }
             }
             
@@ -803,7 +819,7 @@ class PathSimulator:
                     }
                 }
             
-           
+       
         # Store results
         self.results = {
             'returns_pred': returns_pred_selected,
